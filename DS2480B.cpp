@@ -119,7 +119,8 @@ sample code bearing this copyright.
 
 #include "DS2480B.h"
 
-DS2480B::DS2480B(AltSoftSerial port)
+extern HardwareSerial Serial1;
+DS2480B::DS2480B(HardwareSerial *port)
 {
 	_port = port;
 #if ONEWIRE_SEARCH
@@ -129,7 +130,7 @@ DS2480B::DS2480B(AltSoftSerial port)
 
 void DS2480B::begin()
 {
-	_port.write(0xC1);
+	_port->write(0xC1);
 	isCmdMode = true;
 }
 
@@ -143,22 +144,104 @@ void DS2480B::begin()
 uint8_t DS2480B::reset(void)
 {
 	uint8_t r;
-
+	uint8_t error_counter = 0;
+	unsigned long Timeout = millis();
+	bool error = false;
 	commandMode();
-
-	_port.write(0xC1);
+	_port->write(0xC1);
 	//proper return is 0xCD otherwise something was wrong
-	while (!_port.available());
-	r = _port.read();
-	if (r == 0xCD) return 1;
+	if (!waitForReply(3000)) {
+		error = true;
+		_port->write(COMMAND_MODE);
+		//Serial1.println("TIMEOUT 1");
+	}
+	r = _port->read();
+	//Serial1.println(r);
+	if (r == 0xFF) error_counter++;
+	if (r == 0xCD && !error) {
+		return 1;
+	}
+
+	if (r != 0xCD) {
+		_port->write(0xC1);
+		//proper return is 0xCD otherwise something was wrong
+		if (!waitForReply(3000)) {
+				error = true;
+				//Serial1.println("TIMEOUT 2");
+		}
+
+		r = _port->read();
+		//Serial1.println(r);
+		if (r == 0xFF) error_counter++;
+		_port->write(0xC1);
+		//proper return is 0xCD otherwise something was wrong
+		if (!waitForReply(3000)) {
+				error = true;
+				//Serial1.println("TIMEOUT 3");
+		}
+		r = _port->read();
+		//Serial1.println(r);
+		if (r == 0xFF) error_counter++;
+		if (r == 0xCD && !error) {
+
+			return 1;
+		}
+
+		if (error_counter == 3) {
+			Serial1.print("Need restart: ");
+			esp_deep_sleep(1000 * 1000);
+		}
+	}
 	return 0;
 }
+uint8_t DS2480B::startup(void)
+{
+	uint8_t r;
+	uint8_t stage = 0;
+	uint8_t stage_no_sensor = 0;
+	uint8_t stage_sensor = 0;
+	unsigned long Timeout = millis();
+	bool error = false;
+	commandMode();
+	_port->write(0xC1);
+	//proper return is 0xCD otherwise something was wrong
+	while (!_port->available()) {
+		if (millis() - Timeout > 3000) {
+			error = true;
+			break;
+		}
 
+	}
+	r = _port->read();
+	if (r != 0xFC && r != 0x81 && r != 0xCF && r != 0xCD && r != 0x01) {
+
+		error = true;
+	}
+	if (r == 0x81) stage = 1;
+	if (r == 0xCF) stage_no_sensor = 1;
+	if (r == 0xCD) stage_sensor = 1;
+	delay(10);
+	_port->write(0xC1);
+	//proper return is 0xCD otherwise something was wrong
+	while (!_port->available()) {
+		if (millis() - Timeout > 3000) {
+			error = true;
+			break;
+		}
+
+	}
+	r = _port->read();
+	Serial1.println(r);
+	if (r == 0xCD && !error) return 1;
+	if (r == 0xCF && !error && stage_no_sensor == 1) return 1;
+	if (r == 0x81 && !error) return 1;
+	return 0;
+}
 void DS2480B::dataMode()
 {
 	if (isCmdMode)
 	{
-		_port.write(DATA_MODE);
+		_port->write(DATA_MODE);
 		isCmdMode = false;
 	}
 }
@@ -167,11 +250,76 @@ void DS2480B::commandMode()
 {
 	if (!isCmdMode)
 	{
-		_port.write(COMMAND_MODE);
 		isCmdMode = true;
+		_port->write(COMMAND_MODE);
+
 	}
 }
 
+/*configuration commands syntax: 8-bit code contains 3-bit parameter code and 3-bit value code,
+bit 7 is set to 0 and bit 0 is 1 - 0[param][value]1 - write; 0000[param]1 - read
+param:011 is strong pull up, ie 0 011 xxx 1
+xxx milisec:
+000 16.4	16
+001 65.5	65
+010 131		131
+011 262		262
+100 524		524
+101 1048	1048
+110 don't
+111 infinite, probably don't	0
+*/
+
+bool DS2480B::setStrongPullup(int duration)
+{
+	byte pval = 0;
+	uint8_t r;
+
+	if (duration == 16) { pval = B00110001; }
+	else if (duration == 65) { pval = B00110011; }
+	else if (duration == 131) { pval = B00110101; }
+	else if (duration == 262) { pval = B00110111; }
+	else if (duration == 524) { pval = B00111001; }
+	else if (duration == 1048) { pval = B00111011; }
+	else if (duration == 0) { pval = B00111111; }
+	else return false;
+
+	_port->write(pval);
+	if (!waitForReply()) return false; //should respond same as sent - 1
+	r = _port->read();
+	if (r == pval - 1) {
+		return true;
+	}
+	else { return false; }
+}
+
+//arm finite pullup, true if the duration runs out and returns valid response, false if not
+//111011x1 - Pulse, x=1 arm, x=0 disarm;-> 0xEF arm strong pullup, ED disarm strong pullup
+//in command mode a valid response is same as sent with the last 2 bits undefined, i.e EF,ED,EC
+//in datamode a valid response is F6 or 76
+bool DS2480B::armFinitePullup(int duration)
+{
+	uint8_t r;
+
+	_port->write(0xEF);
+	delay(duration);
+	if (!waitForReply()) return false;
+	r = _port->read();
+	if (isCmdMode) {
+		if (r == (0xED) || (0xED) || (0xEC)) {
+			return true;
+		}
+		else { return false; }
+	}
+	else {
+		if (r == (0xF6) || (0x76)) {
+			return true;
+		}
+		else { return false; }
+
+	}
+
+}
 
 void DS2480B::beginTransaction()
 {
@@ -183,12 +331,17 @@ void DS2480B::endTransaction()
 	commandMode();
 }
 
-bool DS2480B::waitForReply()
+bool DS2480B::waitForReply(int timeout)
 {
-	for (uint16_t i = 0; i < 30000; i++)
+	for (uint16_t i = 0; i < timeout; i++)
 	{
-		if (_port.available()) return true;
+		if (_port->available()) {
+			return true;
+		}
+		delay(1);
 	}
+	//Per's suggestion, after that 1-wire is being reset
+	AlarmState = true;
 	return false;
 }
 
@@ -200,10 +353,10 @@ uint8_t DS2480B::write_bit(uint8_t v)
 {
 	uint8_t val;
 	commandMode();
-	if (v == 1) _port.write(0x91); //write a single "on" bit to onewire
-	else _port.write(0x81); //write a single "off" bit to onewire
+	if (v == 1) _port->write(0x91); //write a single "on" bit to onewire
+	else _port->write(0x81); //write a single "off" bit to onewire
 	if (!waitForReply()) return 0;
-	val = _port.read();
+	val = _port->read();
 	return val & 1;
 }
 
@@ -223,16 +376,18 @@ uint8_t DS2480B::read_bit(void)
 // go tri-state at the end of the write to avoid heating in a short or
 // other mishap. - Currently power isn't actually used now.
 //
-void DS2480B::write(uint8_t v, uint8_t power /* = 0 */) {
+void DS2480B::write(uint8_t v, uint8_t power /* = 0 */, bool mode /*=0*/) {
 	uint8_t r;
 
 	dataMode();
 
-	_port.write(v);
+	_port->write(v);
 	//need to double up transmission if the sent byte was one of the command bytes
-	if (v == DATA_MODE || v == COMMAND_MODE || v == PULSE_TERM) _port.write(v);
+	if ((v == DATA_MODE || v == COMMAND_MODE || v == PULSE_TERM) && isCmdMode) {
+		_port->write(v);
+	}
 	if (!waitForReply()) return;
-	r = _port.read(); //throw away reply
+	r = _port->read(); //throw away reply
 }
 
 void DS2480B::writeCmd(uint8_t v, uint8_t power)
@@ -241,10 +396,10 @@ void DS2480B::writeCmd(uint8_t v, uint8_t power)
 
 	commandMode();
 
-	_port.write(v);
+	_port->write(v);
 
 	if (!waitForReply()) return;
-	r = _port.read(); //throw away reply
+	r = _port->read(); //throw away reply
 }
 
 void DS2480B::write_bytes(const uint8_t *buf, uint16_t count, bool power /* = 0 */) {
@@ -259,10 +414,10 @@ uint8_t DS2480B::read() {
 
 	dataMode();
 
-	_port.write(0xFF);
+	_port->write(0xFF);
 	if (!waitForReply()) return 0;
-    r = _port.read();
-    return r;
+	r = _port->read();
+	return r;
 }
 
 void DS2480B::read_bytes(uint8_t *buf, uint16_t count) {
@@ -278,9 +433,18 @@ void DS2480B::select(const uint8_t rom[8])
     uint8_t i;
 
 	dataMode();
-    write(0x55);           // Choose ROM
+	write(0x55, 1);           // Choose ROM //_port->write(0x55)?
 
-    for (i = 0; i < 8; i++) write(rom[i]);
+	for (i = 0; i < 8; i++) write(rom[i], 1, 1);
+}
+void DS2480B::swap(const uint8_t rom[8])
+{
+	uint8_t i;
+
+	dataMode();
+	write(0xAA, 1);           // Choose ROM //_port->write(0x55)?
+
+	for (i = 0; i < 8; i++) write(rom[i], 1, 1);
 }
 
 //
@@ -347,121 +511,128 @@ void DS2480B::target_search(uint8_t family_code)
 //
 uint8_t DS2480B::search(uint8_t *newAddr)
 {
-   uint8_t id_bit_number;
-   uint8_t last_zero, rom_byte_number, search_result;
-   uint8_t id_bit, cmp_id_bit;
+	uint8_t id_bit_number;
+	uint8_t last_zero, rom_byte_number, search_result;
+	uint8_t id_bit, cmp_id_bit;
 
-   unsigned char rom_byte_mask, search_direction;
+	unsigned char rom_byte_mask, search_direction;
 
-   // initialize for search
-   id_bit_number = 1;
-   last_zero = 0;
-   rom_byte_number = 0;
-   rom_byte_mask = 1;
-   search_result = 0;
+	// initialize for search
+	id_bit_number = 1;
+	last_zero = 0;
+	rom_byte_number = 0;
+	rom_byte_mask = 1;
+	search_result = 0;
 
-   // if the last call was not the last one
-   if (!LastDeviceFlag)
-   {
-      // 1-Wire reset
-      if (!reset())
-      {
-         // reset the search
-         LastDiscrepancy = 0;
-         LastDeviceFlag = FALSE;
-         LastFamilyDiscrepancy = 0;
-         return FALSE;
-      }
+	// if the last call was not the last one
+	if (!LastDeviceFlag)
+	{
+		// 1-Wire reset
+		if (!reset())
+		{
+			// reset the search
+			LastDiscrepancy = 0;
+			LastDeviceFlag = FALSE;
+			LastFamilyDiscrepancy = 0;
+			return FALSE;
+		}
 
-      // issue the search command
-      write(0xF0); //send search command to DS18B20 units
+		// issue the search command
+		write(0xF0); //send search command to DS18B20 units
+		// loop to do the search
+		do
+		{
+			// read a bit and its complement
+			id_bit = read_bit();
+			cmp_id_bit = read_bit();
+			// check for no devices on 1-wire
+			if ((id_bit == 1) && (cmp_id_bit == 1))
+				break;
+			else if (AlarmState)
+			{
+				// reset the search
+				LastDiscrepancy = 0;
+				LastDeviceFlag = FALSE;
+				LastFamilyDiscrepancy = 0;
+				return FALSE;
+				break;
+			}
+			else
+			{
+				// all devices coupled have 0 or 1
+				if (id_bit != cmp_id_bit)
+					search_direction = id_bit;  // bit write value for search
+				else
+				{
+					// if this discrepancy if before the Last Discrepancy
+					// on a previous next then pick the same as last time
+					if (id_bit_number < LastDiscrepancy)
+						search_direction = ((ROM_NO[rom_byte_number] & rom_byte_mask) > 0);
+					else
+						// if equal to last pick 1, if not then pick 0
+						search_direction = (id_bit_number == LastDiscrepancy);
 
-      // loop to do the search
-      do
-      {
-         // read a bit and its complement
-         id_bit = read_bit();
-         cmp_id_bit = read_bit();
+					// if 0 was picked then record its position in LastZero
+					if (search_direction == 0)
+					{
+						last_zero = id_bit_number;
 
-         // check for no devices on 1-wire
-         if ((id_bit == 1) && (cmp_id_bit == 1))
-            break;
-         else
-         {
-            // all devices coupled have 0 or 1
-            if (id_bit != cmp_id_bit)
-               search_direction = id_bit;  // bit write value for search
-            else
-            {
-               // if this discrepancy if before the Last Discrepancy
-               // on a previous next then pick the same as last time
-               if (id_bit_number < LastDiscrepancy)
-                  search_direction = ((ROM_NO[rom_byte_number] & rom_byte_mask) > 0);
-               else
-                  // if equal to last pick 1, if not then pick 0
-                  search_direction = (id_bit_number == LastDiscrepancy);
+						// check for Last discrepancy in family
+						if (last_zero < 9)
+							LastFamilyDiscrepancy = last_zero;
+					}
+				}
 
-               // if 0 was picked then record its position in LastZero
-               if (search_direction == 0)
-               {
-                  last_zero = id_bit_number;
+				// set or clear the bit in the ROM byte rom_byte_number
+				// with mask rom_byte_mask
+				if (search_direction == 1)
+					ROM_NO[rom_byte_number] |= rom_byte_mask;
+				else
+					ROM_NO[rom_byte_number] &= ~rom_byte_mask;
 
-                  // check for Last discrepancy in family
-                  if (last_zero < 9)
-                     LastFamilyDiscrepancy = last_zero;
-               }
-            }
+				// serial number search direction write bit
+				write_bit(search_direction);
 
-            // set or clear the bit in the ROM byte rom_byte_number
-            // with mask rom_byte_mask
-            if (search_direction == 1)
-              ROM_NO[rom_byte_number] |= rom_byte_mask;
-            else
-              ROM_NO[rom_byte_number] &= ~rom_byte_mask;
+				// increment the byte counter id_bit_number
+				// and shift the mask rom_byte_mask
+				id_bit_number++;
+				rom_byte_mask <<= 1;
 
-            // serial number search direction write bit
-            write_bit(search_direction);
+				// if the mask is 0 then go to new SerialNum byte rom_byte_number and reset mask
+				if (rom_byte_mask == 0)
+				{
+					rom_byte_number++;
+					rom_byte_mask = 1;
+				}
+			}
+			delay(1);
+		} while (rom_byte_number < 8);  // loop until through all ROM bytes 0-7
 
-            // increment the byte counter id_bit_number
-            // and shift the mask rom_byte_mask
-            id_bit_number++;
-            rom_byte_mask <<= 1;
+		// if the search was successful then
+		if (!(id_bit_number < 65))
+		{
+			// search successful so set LastDiscrepancy,LastDeviceFlag,search_result
+			LastDiscrepancy = last_zero;
 
-            // if the mask is 0 then go to new SerialNum byte rom_byte_number and reset mask
-            if (rom_byte_mask == 0)
-            {
-                rom_byte_number++;
-                rom_byte_mask = 1;
-            }
-         }
-      }
-      while(rom_byte_number < 8);  // loop until through all ROM bytes 0-7
+			// check for last device
+			if (LastDiscrepancy == 0)
+				LastDeviceFlag = TRUE;
 
-      // if the search was successful then
-      if (!(id_bit_number < 65))
-      {
-         // search successful so set LastDiscrepancy,LastDeviceFlag,search_result
-         LastDiscrepancy = last_zero;
+			search_result = TRUE;
+		}
+	}
 
-         // check for last device
-         if (LastDiscrepancy == 0)
-            LastDeviceFlag = TRUE;
-
-         search_result = TRUE;
-      }
-   }
-
-   // if no device found then reset counters so next 'search' will be like a first
-   if (!search_result || !ROM_NO[0])
-   {
-      LastDiscrepancy = 0;
-      LastDeviceFlag = FALSE;
-      LastFamilyDiscrepancy = 0;
-      search_result = FALSE;
-   }
-   for (int i = 0; i < 8; i++) newAddr[i] = ROM_NO[i];
-   return search_result;
-  }
+	// if no device found then reset counters so next 'search' will be like a first
+	if (!search_result || !ROM_NO[0])
+	{
+		LastDiscrepancy = 0;
+		LastDeviceFlag = FALSE;
+		LastFamilyDiscrepancy = 0;
+		search_result = FALSE;
+	}
+	for (int i = 0; i < 8; i++) newAddr[i] = ROM_NO[i];
+	return search_result;
+}
 
 #endif
 

@@ -10,7 +10,9 @@
 #include "pins_arduino.h"  // for digitalPinToBitMask, etc
 #endif
 
-#include "AltSoftSerial.h"
+
+#include "HardwareSerial.h"
+
 
 // You can exclude certain features from OneWire.  In theory, this
 // might save some space.  In practice, the compiler automatically
@@ -71,47 +73,54 @@
 
 class DS2480B
 {
-  private:
-	AltSoftSerial _port;
+private:
+	HardwareSerial * _port;
 	bool isCmdMode;
 
 #if ONEWIRE_SEARCH
-    // global search state
-    unsigned char ROM_NO[8];
-    uint8_t LastDiscrepancy;
-    uint8_t LastFamilyDiscrepancy;
-    uint8_t LastDeviceFlag;
+	// global search state
+	unsigned char ROM_NO[8];
+	uint8_t LastDiscrepancy;
+	uint8_t LastFamilyDiscrepancy;
+	//uint8_t LastDeviceFlag;
 #endif
 
-  bool waitForReply();
+	bool waitForReply(int timeout=30000);
 
-  public:
-    DS2480B(AltSoftSerial port);
-
+public:
+	DS2480B(HardwareSerial *port);
+	uint8_t LastDeviceFlag;
 	void begin();
+	bool AlarmState = false;
 
-    // Perform a 1-Wire reset cycle. Returns 1 if a device responds
-    // with a presence pulse.  Returns 0 if there is no device or the
-    // bus is shorted or otherwise held low for more than 250uS
-    uint8_t reset(void);
-
+	// Perform a 1-Wire reset cycle. Returns 1 if a device responds
+	// with a presence pulse.  Returns 0 if there is no device or the
+	// bus is shorted or otherwise held low for more than 250uS
+	uint8_t reset(void);
+	uint8_t startup(void);
 	void beginTransaction();
 	void endTransaction();
 
 	void commandMode();
 	void dataMode();
 
-    // Issue a 1-Wire rom select command, you do the reset first.
-    void select(const uint8_t rom[8]);
+	//set duration of 5V strong pull up
+	bool setStrongPullup(int duration);
 
-    // Issue a 1-Wire rom skip command, to address all on bus.
-    void skip(void);
+	//arm the pullup and wait for response 
+	bool armFinitePullup(int duration);
 
-    // Write a byte. If 'power' is one then the wire is held high at
-    // the end for parasitically powered devices. You are responsible
-    // for eventually depowering it by calling depower() or doing
-    // another read or write.
-    void write(uint8_t v, uint8_t power = 0);
+	// Issue a 1-Wire rom select command, you do the reset first.
+	void select(const uint8_t rom[8]);
+	void swap(const uint8_t rom[8]);
+	// Issue a 1-Wire rom skip command, to address all on bus.
+	void skip(void);
+
+	// Write a byte. If 'power' is one then the wire is held high at
+	// the end for parasitically powered devices. You are responsible
+	// for eventually depowering it by calling depower() or doing
+	// another read or write.
+	void write(uint8_t v, uint8_t power = 0, bool mode = 0);
 
 	void writeCmd(uint8_t v, uint8_t power = 0);
 
